@@ -4,42 +4,13 @@
  *
  * INTERSECTION 2 VERSION (Local Control 2)
  *
- * Keyboard events (send to /traffic_mq):
- *   t = Train detected  (request train mode)
- *   c = Train cleared   (request exit train mode at next SAFE all-red)  [Option A]
- *   p = Ped button      (ped_request=1)
- *
- * Notify messages:
- *   *** TRAIN BEGIN ***
- *   *** TRAIN OVER  ***
- *   >>> TRAIN PREEMPT: forcing YELLOW immediately <<<
- *   >>> TRAIN CLEAR: will exit at next SAFE ALL-RED <<<
- *   *** PED BEGIN   ***
- *   *** PED OVER    ***
- *
- * Behaviour:
- * 1) Press 't' during NORMAL GREEN:
- *    - Force matching YELLOW immediately (within ~100ms)
- *    - After forced YELLOW finishes, jump DIRECTLY to ALL-RED (skip left phases)
- *    - Then enter TRAIN mode
- *
- * 2) Press 'c' during TRAIN (Option A):
- *    - DO NOT change lights immediately
- *    - Set train_clear_pending=1
- *    - Keep running the TRAIN sequence until the next SAFE ALL-RED checkpoint
- *      (T_ALL_RED_A, T_ALL_RED_B, or T_DECISION_ALL_RED_4)
- *    - Exit to NORMAL from that checkpoint
- *
- * INTERSECTION 2 TRAIN RULE CHANGES:
- * - The "clear cars" movements apply to R3 (S->N) (NOT R3 N->S).
- * - R2 restrictions during train:
- *     R2 (W->E): cannot turn right  => allow Straight+Left  (SL)
- *     R2 (E->W): cannot turn left   => allow Straight+Right (SR)
+ * Key update:
+ * - R3 is a major road (high traffic) -> keep longer greens
+ * - R2 is moderate traffic -> shorter greens than R3
  *
  * UPDATE APPLIED:
- * - TRAIN state 0 (entry all-red) REMOVED.
- * - TRAIN starts directly at TRAIN state 1 (T_R3_NS_SRL_G_1).
- * - All other behaviour kept the same.
+ * - TRAIN state 0 REMOVED (no entry all-red state)
+ * - TRAIN starts at TRAIN state 1 (T_R3_NS_SRL_G_1)
  */
 
 #include <stdio.h>
@@ -59,18 +30,27 @@
 #define EVT_TRAIN_CLEAR   'c'
 #define EVT_PED_PRESS     'p'
 
-/* ================= TIMINGS (seconds) ================= */
-#define T_RS_GREEN   20
-#define T_L_GREEN    12
-#define T_YELLOW      4
-#define T_ALL_RED     2
+/* ================= TIMINGS (seconds) =================
+ * R3: high traffic (major road) -> longer greens
+ * R2: moderate traffic          -> shorter greens
+ */
+#define T_R3_RS_GREEN   20
+#define T_R3_L_GREEN    12
 
+#define T_R2_RS_GREEN   15   /* reduced from 20 */
+#define T_R2_L_GREEN     8   /* reduced from 12 */
+
+#define T_YELLOW         4
+#define T_ALL_RED        2
+
+/* TRAIN timings */
 #define T_TR_1_G      8
 #define T_TR_2_G      8
 #define T_TR_3_G     15
 #define T_TR_Y        4
 #define T_TR_R        2
 
+/* PED timings */
 #define T_PED_WALK    8
 #define T_PED_FLASH   4
 #define T_PED_CLR     2
@@ -92,13 +72,12 @@ static int train_preempt_notified = 0;
 static int train_preempt_to_allred = 0;
 
 /* ================= STATE ENUM =================
- * Explicit numbering keeps your mode_index logic stable:
- *   NORMAL: 0..9
- *   TRAIN : 10..18  (starts at TRAIN state 1)
- *   PED   : 20..22
+ * NORMAL: 0..9
+ * TRAIN : 10..18  (starts at TRAIN state 1)
+ * PED   : 20..22
  */
 typedef enum {
-    /* ---------- NORMAL (S0..S9) ---------- */
+    /* ---------- NORMAL ---------- */
     N_R3_RS_G = 0,
     N_R3_RS_Y,
     N_R3_L_G,
@@ -119,7 +98,7 @@ typedef enum {
     T_ALL_RED_B,          /* SAFE */
     T_R2_RESTRICT_G_3,
     T_R2_RESTRICT_Y_3,
-    T_DECISION_ALL_RED_4, /* SAFE (decision/exit) */
+    T_DECISION_ALL_RED_4, /* SAFE */
 
     /* ---------- PEDESTRIAN ---------- */
     P_WALK = 20,
@@ -169,14 +148,13 @@ static void poll_events_from_mq(void)
         if (ev == EVT_TRAIN_DETECT) {
             train_request = 1;
             train_active  = 1;
-            train_clear_pending = 0; /* cancel pending clear */
+            train_clear_pending = 0;
 
-            /* allow PREEMPT message to print again for each new train request */
             train_preempt_notified = 0;
             train_preempt_to_allred = 0;
         } else if (ev == EVT_TRAIN_CLEAR) {
-            train_clear_pending = 1; /* Option A */
-            train_request = 0;       /* cancel any pending enter */
+            train_clear_pending = 1;
+            train_request = 0;
         } else if (ev == EVT_PED_PRESS) {
             ped_request = 1;
         }
@@ -209,20 +187,21 @@ static int mode_index_of(state_t s)
 static unsigned duration_of(state_t s)
 {
     switch (s) {
-        /* NORMAL */
-        case N_R3_RS_G:   return T_RS_GREEN;
+        /* NORMAL (R3 high traffic) */
+        case N_R3_RS_G:   return T_R3_RS_GREEN;
         case N_R3_RS_Y:   return T_YELLOW;
-        case N_R3_L_G:    return T_L_GREEN;
+        case N_R3_L_G:    return T_R3_L_GREEN;
         case N_R3_L_Y:    return T_YELLOW;
         case N_ALL_RED_1: return T_ALL_RED;
 
-        case N_R2_RS_G:   return T_RS_GREEN;
+        /* NORMAL (R2 moderate traffic) */
+        case N_R2_RS_G:   return T_R2_RS_GREEN;
         case N_R2_RS_Y:   return T_YELLOW;
-        case N_R2_L_G:    return T_L_GREEN;
+        case N_R2_L_G:    return T_R2_L_GREEN;
         case N_R2_L_Y:    return T_YELLOW;
         case N_ALL_RED_2: return T_ALL_RED;
 
-        /* TRAIN (starts at state 1) */
+        /* TRAIN */
         case T_R3_NS_SRL_G_1:       return T_TR_1_G;
         case T_R3_NS_SRL_Y_1:       return T_TR_Y;
         case T_ALL_RED_A:           return T_TR_R;
@@ -317,36 +296,22 @@ static void print_state_outputs(state_t s)
         case N_R2_L_G:  r2_we = "L-G";  r2_ew = "L-G";  break;
         case N_R2_L_Y:  r2_we = "L-Y";  r2_ew = "L-Y";  break;
 
-        /* TRAIN (INTERSECTION 2 CHANGE)
-         * Apply the "clear" phases to R3(S->N); keep R3(N->S) RED.
-         */
+        /* TRAIN (Intersection 2 rule: clear cars applies to R3 S->N only) */
         case T_R3_NS_SRL_G_1: r3_sn = "SRL-G"; break;
         case T_R3_NS_SRL_Y_1: r3_sn = "SRL-Y"; break;
 
         case T_R3_SN_LR_G_2:  r3_sn = "LR-G";  break;
         case T_R3_SN_LR_Y_2:  r3_sn = "LR-Y";  break;
 
-        /* TRAIN (INTERSECTION 2 CHANGE)
-         * R2 restrictions during train:
-         * - W->E cannot turn right => SL
-         * - E->W cannot turn left  => SR
-         */
-        case T_R2_RESTRICT_G_3:
-            r2_we = "SL-G";
-            r2_ew = "SR-G";
-            break;
-
-        case T_R2_RESTRICT_Y_3:
-            r2_we = "SL-Y";
-            r2_ew = "SR-Y";
-            break;
+        /* TRAIN R2 restrictions */
+        case T_R2_RESTRICT_G_3: r2_we = "SL-G"; r2_ew = "SR-G"; break;
+        case T_R2_RESTRICT_Y_3: r2_we = "SL-Y"; r2_ew = "SR-Y"; break;
 
         /* PED */
         case P_WALK:  ped = "WALK";  break;
         case P_FLASH: ped = "FLASH"; break;
 
-        default:
-            break;
+        default: break;
     }
 
     printf("[%s S%d] (%us) | R3(S->N)=%-6s | R3(N->S)=%-6s | R2(W->E)=%-6s | R2(E->W)=%-6s | PED=%-5s\n",
@@ -372,7 +337,6 @@ static void wait_seconds_interruptible(unsigned total_sec, state_t *cur)
         nanosleep(&ts, NULL);
         poll_events_from_mq();
 
-        /* PREEMPT: normal green -> yellow immediately */
         if (cur && train_request && !in_train_mode && is_normal_green(*cur)) {
             if (!train_preempt_notified) {
                 notify_train_preempt();
@@ -416,7 +380,6 @@ static void do_exit_train_to_normal(state_t *cur)
     train_clear_pending = 0;
     train_request = 0;
 
-    /* reset so next 't' can preempt+print again */
     train_preempt_notified = 0;
     train_preempt_to_allred = 0;
 
@@ -436,7 +399,6 @@ static void SingleStep_SM(state_t *cur)
     print_state_outputs(*cur);
     poll_events_from_mq();
 
-    /* notify once when clear is requested */
     static int clear_notified_once = 0;
     if (train_clear_pending && !clear_notified_once) {
         notify_train_clear();
@@ -445,10 +407,9 @@ static void SingleStep_SM(state_t *cur)
     if (!train_clear_pending) clear_notified_once = 0;
 
     switch (*cur) {
-
-        /* ===================== NORMAL ===================== */
+        /* NORMAL */
         case N_R3_RS_G:
-            wait_seconds_interruptible(T_RS_GREEN, cur);
+            wait_seconds_interruptible(T_R3_RS_GREEN, cur);
             if (*cur != N_R3_RS_G) break;
             *cur = N_R3_RS_Y;
             break;
@@ -456,13 +417,12 @@ static void SingleStep_SM(state_t *cur)
         case N_R3_RS_Y:
             wait_seconds_interruptible(T_YELLOW, cur);
             if (*cur != N_R3_RS_Y) break;
-
             if (train_request && train_preempt_to_allred) *cur = N_ALL_RED_1;
             else *cur = N_R3_L_G;
             break;
 
         case N_R3_L_G:
-            wait_seconds_interruptible(T_L_GREEN, cur);
+            wait_seconds_interruptible(T_R3_L_GREEN, cur);
             if (*cur != N_R3_L_G) break;
             *cur = N_R3_L_Y;
             break;
@@ -483,13 +443,10 @@ static void SingleStep_SM(state_t *cur)
                 train_active  = 1;
                 train_clear_pending = 0;
 
-                /* clean preempt flags at entry */
                 train_preempt_notified = 0;
                 train_preempt_to_allred = 0;
 
-                /* TRAIN starts at STATE 1 now */
                 *cur = T_R3_NS_SRL_G_1;
-
                 if (!in_train_mode) { in_train_mode = 1; notify_train_begin(); }
                 break;
             }
@@ -499,7 +456,7 @@ static void SingleStep_SM(state_t *cur)
             break;
 
         case N_R2_RS_G:
-            wait_seconds_interruptible(T_RS_GREEN, cur);
+            wait_seconds_interruptible(T_R2_RS_GREEN, cur);
             if (*cur != N_R2_RS_G) break;
             *cur = N_R2_RS_Y;
             break;
@@ -507,13 +464,12 @@ static void SingleStep_SM(state_t *cur)
         case N_R2_RS_Y:
             wait_seconds_interruptible(T_YELLOW, cur);
             if (*cur != N_R2_RS_Y) break;
-
             if (train_request && train_preempt_to_allred) *cur = N_ALL_RED_2;
             else *cur = N_R2_L_G;
             break;
 
         case N_R2_L_G:
-            wait_seconds_interruptible(T_L_GREEN, cur);
+            wait_seconds_interruptible(T_R2_L_GREEN, cur);
             if (*cur != N_R2_L_G) break;
             *cur = N_R2_L_Y;
             break;
@@ -537,9 +493,7 @@ static void SingleStep_SM(state_t *cur)
                 train_preempt_notified = 0;
                 train_preempt_to_allred = 0;
 
-                /* TRAIN starts at STATE 1 now */
                 *cur = T_R3_NS_SRL_G_1;
-
                 if (!in_train_mode) { in_train_mode = 1; notify_train_begin(); }
                 break;
             }
@@ -548,7 +502,7 @@ static void SingleStep_SM(state_t *cur)
             *cur = N_R3_RS_G;
             break;
 
-        /* ===================== TRAIN ===================== */
+        /* TRAIN */
         case T_R3_NS_SRL_G_1:
             wait_seconds_interruptible(T_TR_1_G, cur);
             *cur = T_R3_NS_SRL_Y_1;
@@ -562,10 +516,8 @@ static void SingleStep_SM(state_t *cur)
         case T_ALL_RED_A:
             wait_seconds_interruptible(T_TR_R, cur);
             poll_events_from_mq();
-
             if (should_exit_train_now(*cur)) { do_exit_train_to_normal(cur); break; }
             if (try_start_ped_if_safe(cur)) break;
-
             *cur = T_R3_SN_LR_G_2;
             break;
 
@@ -582,10 +534,8 @@ static void SingleStep_SM(state_t *cur)
         case T_ALL_RED_B:
             wait_seconds_interruptible(T_TR_R, cur);
             poll_events_from_mq();
-
             if (should_exit_train_now(*cur)) { do_exit_train_to_normal(cur); break; }
             if (try_start_ped_if_safe(cur)) break;
-
             *cur = T_R2_RESTRICT_G_3;
             break;
 
@@ -602,15 +552,13 @@ static void SingleStep_SM(state_t *cur)
         case T_DECISION_ALL_RED_4:
             wait_seconds_interruptible(T_TR_R, cur);
             poll_events_from_mq();
-
             if (should_exit_train_now(*cur)) { do_exit_train_to_normal(cur); break; }
             if (try_start_ped_if_safe(cur)) break;
-
             if (train_active && !train_clear_pending) *cur = T_R3_SN_LR_G_2;
             else do_exit_train_to_normal(cur);
             break;
 
-        /* ===================== PEDESTRIAN ===================== */
+        /* PEDESTRIAN */
         case P_WALK:
             wait_seconds_interruptible(T_PED_WALK, cur);
             *cur = P_FLASH;
@@ -632,7 +580,6 @@ static void SingleStep_SM(state_t *cur)
             break;
     }
 
-    /* ensure begin notify if train states entered */
     if (is_train_state(*cur) && !in_train_mode) {
         in_train_mode = 1;
         notify_train_begin();
