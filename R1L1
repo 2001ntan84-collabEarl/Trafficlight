@@ -1,0 +1,180 @@
+/*
+ * R1L1.c (vm7) - R1 local controller (silent, fixed switching)
+ * Timed FSM, MODE-BASED
+ *
+ * CMD queue (2 bytes): /cmd_r1l1 : [mode][active]
+ *   mode:   'N' normal, 'T' train, 'C' clear request
+ *   active: '1' or '3'
+ *
+ * REPORT queue (32 bytes): /i1_report : [id][d1][d2][sec][label...]
+ *   id='1', d1=WE state, d2=EW state
+ */
+
+#include <unistd.h>
+#include <mqueue.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <string.h>
+#include <errno.h>
+
+#define Q_CMD   "/cmd_r1l1"
+#define Q_REP   "/i1_report"
+
+#define CMD_SIZE 2
+#define REP_SIZE 32
+
+/* NORMAL timings */
+#define T_RS_GREEN 20
+#define T_L_GREEN  12
+#define T_YELLOW    4
+#define T_ALL_RED   2
+
+/* TRAIN timings (R1) */
+#define T_TR_S6 15
+#define T_TR_S7 4
+#define T_TR_S8 2
+#define T_TR_EX 5
+
+static void send_report(mqd_t rep, char we, char ew, int sec, const char *label)
+{
+    char msg[REP_SIZE];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = '1';
+    msg[1] = we;
+    msg[2] = ew;
+    msg[3] = (char)sec;
+    strncpy(&msg[4], label, REP_SIZE - 5);
+    (void)mq_send(rep, msg, REP_SIZE, 0);
+}
+
+/* IMPORTANT FIX:
+ * Drain ALL pending commands; keep the latest mode/active.
+ */
+static void drain_cmd(mqd_t cmdq, char *mode, char *active)
+{
+    char c[CMD_SIZE];
+    while (mq_receive(cmdq, c, CMD_SIZE, NULL) == CMD_SIZE) {
+        *mode   = c[0];
+        *active = c[1];
+    }
+}
+
+static void sleep_poll(int sec, mqd_t cmdq, char *mode, char *active)
+{
+    for (int i = 0; i < sec * 10; i++) {
+        usleep(100000);
+        drain_cmd(cmdq, mode, active);
+    }
+}
+
+static char to_yellow(char s)
+{
+    if (s=='A') return 'B';  /* RS G -> Y */
+    if (s=='C') return 'D';  /* L  G -> Y */
+    if (s=='I') return 'K';  /* SR G -> Y */
+    if (s=='J') return 'L';  /* SL G -> Y */
+    return 'R';
+}
+
+int main(void)
+{
+    struct mq_attr a;
+    memset(&a, 0, sizeof(a));
+    a.mq_maxmsg  = 50;
+    a.mq_msgsize = CMD_SIZE;
+
+    mq_unlink(Q_CMD);
+    mqd_t cmdq = mq_open(Q_CMD, O_CREAT | O_RDONLY | O_NONBLOCK, 0666, &a);
+    if (cmdq == (mqd_t)-1) return 1;
+
+    mqd_t rep;
+    while ((rep = mq_open(Q_REP, O_WRONLY)) == (mqd_t)-1) usleep(200000);
+
+    char mode='N', active='3';
+    char we='R', ew='R';
+    int clear_req = 0;
+
+    for (;;) {
+
+        drain_cmd(cmdq, &mode, &active);
+
+        /* ================= NORMAL ================= */
+        if (mode=='N') {
+            clear_req = 0;
+
+            /* Not my turn -> force RED + HOLD once */
+            if (active!='1') {
+                if (we!='R' || ew!='R') {
+                    we='R'; ew='R';
+                    send_report(rep, we, ew, 0, "HOLD");
+                }
+                usleep(100000);
+                continue;
+            }
+
+            /* NORMAL S5..S9 */
+            we='A'; ew='A';
+            send_report(rep, we, ew, T_RS_GREEN, "NORMAL S5");
+            sleep_poll(T_RS_GREEN, cmdq, &mode, &active);
+            if (mode!='N' || active!='1') continue;
+
+            we='B'; ew='B';
+            send_report(rep, we, ew, T_YELLOW, "NORMAL S6");
+            sleep_poll(T_YELLOW, cmdq, &mode, &active);
+            if (mode!='N' || active!='1') continue;
+
+            we='C'; ew='C';
+            send_report(rep, we, ew, T_L_GREEN, "NORMAL S7");
+            sleep_poll(T_L_GREEN, cmdq, &mode, &active);
+            if (mode!='N' || active!='1') continue;
+
+            we='D'; ew='D';
+            send_report(rep, we, ew, T_YELLOW, "NORMAL S8");
+            sleep_poll(T_YELLOW, cmdq, &mode, &active);
+            if (mode!='N' || active!='1') continue;
+
+            we='R'; ew='R';
+            send_report(rep, we, ew, T_ALL_RED, "NORMAL S9");
+            sleep_poll(T_ALL_RED, cmdq, &mode, &active);
+            continue;
+        }
+
+        /* ================= TRAIN ================= */
+        if (mode=='T' || mode=='C') {
+            if (mode=='C') clear_req = 1;
+
+            /* Preempt: if currently green, go yellow -> all-red */
+            if (we!='R' || ew!='R') {
+                we = to_yellow(we);
+                ew = to_yellow(ew);
+                send_report(rep, we, ew, T_YELLOW, "PREEMPT");
+                sleep_poll(T_YELLOW, cmdq, &mode, &active);
+
+                we='R'; ew='R';
+                send_report(rep, we, ew, T_ALL_RED, "PRE-RED");
+                sleep_poll(T_ALL_RED, cmdq, &mode, &active);
+            }
+
+            /* Train phases */
+            we='I'; ew='J';
+            send_report(rep, we, ew, T_TR_S6, "TRAIN S6");
+            sleep_poll(T_TR_S6, cmdq, &mode, &active);
+
+            we='K'; ew='L';
+            send_report(rep, we, ew, T_TR_S7, "TRAIN S7");
+            sleep_poll(T_TR_S7, cmdq, &mode, &active);
+
+            we='R'; ew='R';
+            send_report(rep, we, ew, T_TR_S8, "TRAIN S8");
+            sleep_poll(T_TR_S8, cmdq, &mode, &active);
+
+            if (clear_req) {
+                we='R'; ew='R';
+                send_report(rep, we, ew, T_TR_EX, "TRAIN EX");
+                sleep_poll(T_TR_EX, cmdq, &mode, &active);
+                clear_req = 0;
+                mode = 'N';
+            }
+        }
+    }
+}
