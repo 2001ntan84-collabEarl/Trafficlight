@@ -1,0 +1,244 @@
+/* ============================================================
+ * L1.c (vm7) - Mode-based coordinator + QNET events + printing
+ *
+ * CMD queues (2 bytes):
+ *   /cmd_r3l1 : [mode][active]
+ *   /cmd_r1l1 : [mode][active]
+ *     mode:   'N' normal, 'T' train, 'C' clear request
+ *     active: '3' or '1' (only for normal)
+ *
+ * REPORT queue (32 bytes fixed):
+ *   /i1_report : [id][d1][d2][sec][label...]
+ *     id  : '3' or '1'
+ *     d1  : R3_SN or R1_WE state code
+ *     d2  : R3_NS or R1_EW state code
+ *     sec : duration (0..255)
+ *     label: null-terminated string (max 28 bytes incl '\0')
+ *
+ * QNET attach:
+ *   /dev/name/local/i1evt  receives pulses 't','c'
+ * ============================================================ */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <mqueue.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <spawn.h>
+#include <string.h>
+#include <errno.h>
+#include <stdint.h>
+
+#include <sys/dispatch.h>
+#include <sys/neutrino.h>
+
+#define BIN_R3      "/tmp/R3L1"
+#define BIN_R1      "/tmp/R1L1"
+
+#define Q_CMD_R3    "/cmd_r3l1"
+#define Q_CMD_R1    "/cmd_r1l1"
+#define Q_REPORT    "/i1_report"
+
+#define EVT_ATTACH_NAME "i1evt"
+
+#define CMD_SIZE    2
+#define REP_SIZE    32
+
+static const char* st_str(char c)
+{
+    switch (c) {
+        case 'A': return "RS-G";
+        case 'B': return "RS-Y";
+        case 'C': return "L-G";
+        case 'D': return "L-Y";
+        case 'E': return "SRL-G";
+        case 'F': return "SRL-Y";
+        case 'G': return "LR-G";
+        case 'H': return "LR-Y";
+        case 'I': return "SR-G";
+        case 'K': return "SR-Y";
+        case 'J': return "SL-G";
+        case 'L': return "SL-Y";
+        default:  return "RED";
+    }
+}
+
+static int spawn_process(const char *path)
+{
+    int pid = spawnlp(P_NOWAIT, path, path, (char*)NULL);
+    if (pid == -1) { perror("spawnlp"); return -1; }
+    printf("[L1] Started %s (pid=%d)\n", path, pid);
+    fflush(stdout);
+    return pid;
+}
+
+static void send_cmd(mqd_t q, char mode, char active)
+{
+    char c[CMD_SIZE] = { mode, active };
+    if (mq_send(q, c, CMD_SIZE, 0) == -1) {
+        perror("mq_send(cmd)");
+    }
+}
+
+int main(void)
+{
+    printf("[L1] mode-based coordinator, QNET attach: %s\n", EVT_ATTACH_NAME);
+    fflush(stdout);
+
+    /* 1) Create REPORT queue (fixed-size messages) */
+    struct mq_attr ar;
+    memset(&ar, 0, sizeof(ar));
+    ar.mq_maxmsg  = 200;
+    ar.mq_msgsize = REP_SIZE;
+
+    mq_unlink(Q_REPORT);
+    mqd_t rep = mq_open(Q_REPORT, O_CREAT | O_RDONLY | O_NONBLOCK, 0666, &ar);
+    if (rep == (mqd_t)-1) { perror("mq_open(/i1_report)"); return 1; }
+
+    /* 2) QNET attach */
+    name_attach_t *att = name_attach(NULL, EVT_ATTACH_NAME, 0);
+    if (!att) { perror("name_attach(i1evt)"); return 1; }
+    printf("[L1] QNET ready: /dev/name/local/%s\n", EVT_ATTACH_NAME);
+    fflush(stdout);
+
+    /* 3) Spawn nodes */
+    if (spawn_process(BIN_R3) == -1) return 1;
+    if (spawn_process(BIN_R1) == -1) return 1;
+
+    /* 4) Open command queues (writers) */
+    mqd_t q3, q1;
+    while ((q3 = mq_open(Q_CMD_R3, O_WRONLY)) == (mqd_t)-1) usleep(200000);
+    while ((q1 = mq_open(Q_CMD_R1, O_WRONLY)) == (mqd_t)-1) usleep(200000);
+
+    /* 5) Start NORMAL active=R3 */
+    char mode = 'N';
+    char active = '3';
+    int train_active = 0;
+
+    printf("[L1] NORMAL start (active=R3)\n\n");
+    fflush(stdout);
+
+    send_cmd(q3, mode, active);
+    send_cmd(q1, mode, active);
+
+    /* latest states (for combined printing) */
+    char r3_sn='R', r3_ns='R';
+    char r1_we='R', r1_ew='R';
+
+    /* used to alternate active road in NORMAL */
+    int want_switch_to_r1 = 0;
+    int want_switch_to_r3 = 0;
+
+    for (;;) {
+
+        /* ---------- QNET pulses (non-blocking) ---------- */
+        struct _pulse p;
+        uint64_t zero = 0;
+        for (;;) {
+            TimerTimeout(CLOCK_REALTIME, _NTO_TIMEOUT_RECEIVE, NULL, &zero, NULL);
+            int rc = MsgReceivePulse(att->chid, &p, sizeof(p), NULL);
+            if (rc == -1) {
+                if (errno == ETIMEDOUT) break;
+                perror("MsgReceivePulse");
+                break;
+            }
+
+            if (p.code=='t' || p.code=='T') {
+                if (!train_active) {
+                    train_active = 1;
+                    mode = 'T';
+                    printf("\n*** TRAIN BEGIN ***\n\n");
+                    fflush(stdout);
+                    send_cmd(q3, mode, active);
+                    send_cmd(q1, mode, active);
+                }
+            }
+            else if (p.code=='c' || p.code=='C') {
+                if (train_active) {
+                    mode = 'C';
+                    printf("\n>>> TRAIN CLEAR: will exit at next SAFE ALL-RED <<<\n\n");
+                    fflush(stdout);
+                    send_cmd(q3, mode, active);
+                    send_cmd(q1, mode, active);
+                }
+            }
+        }
+
+        /* ---------- REPORT messages ---------- */
+        char m[REP_SIZE];
+        while (mq_receive(rep, m, REP_SIZE, NULL) == REP_SIZE) {
+            char id = m[0];
+            char d1 = m[1];
+            char d2 = m[2];
+            unsigned sec = (unsigned char)m[3];
+            const char *label = (const char*)&m[4];
+
+            if (id == '3') { r3_sn = d1; r3_ns = d2; }
+            if (id == '1') { r1_we = d1; r1_ew = d2; }
+
+            printf("[%s] (%us) | R3(S->N)=%-6s | R3(N->S)=%-6s | R1(W->E)=%-6s | R1(E->W)=%-6s | PED=RED\n",
+                   label, sec,
+                   st_str(r3_sn), st_str(r3_ns),
+                   st_str(r1_we), st_str(r1_ew));
+            fflush(stdout);
+
+            /* NORMAL switching (deterministic, immediate) */
+            if (!train_active && mode == 'N') {
+
+                /* R3 finished -> give turn to R1 */
+                if (id == '3' && strcmp(label, "NORMAL S4") == 0) {
+                    active = '1';
+                    send_cmd(q3, mode, active);
+                    send_cmd(q1, mode, active);
+
+                    printf("\n[L1] SWITCH -> active=R1\n\n");
+                    fflush(stdout);
+                }
+
+                /* R1 finished -> give turn to R3 */
+                if (id == '1' && strcmp(label, "NORMAL S9") == 0) {
+                    active = '3';
+                    send_cmd(q3, mode, active);
+                    send_cmd(q1, mode, active);
+
+                    printf("\n[L1] SWITCH -> active=R3\n\n");
+                    fflush(stdout);
+                }
+            }
+
+            /* TRAIN end detection: when we see TRAIN EX from both nodes -> go back normal */
+            if (train_active && strcmp(label, "TRAIN EX") == 0) {
+                /* Simple rule: once BOTH are red after EX, L1 returns to NORMAL */
+                if (r3_sn=='R' && r3_ns=='R' && r1_we=='R' && r1_ew=='R') {
+                    train_active = 0;
+                    mode = 'N';
+                    active = '3';
+                    printf("\n*** TRAIN OVER ***\n\n");
+                    fflush(stdout);
+                    send_cmd(q3, mode, active);
+                    send_cmd(q1, mode, active);
+                }
+            }
+        }
+
+        /* ---------- NORMAL active swapping (deterministic) ---------- */
+        if (!train_active && mode=='N') {
+            if (want_switch_to_r1) {
+                want_switch_to_r1 = 0;
+                active = '1';
+                send_cmd(q3, mode, active);
+                send_cmd(q1, mode, active);
+            }
+            if (want_switch_to_r3) {
+                want_switch_to_r3 = 0;
+                active = '3';
+                send_cmd(q3, mode, active);
+                send_cmd(q1, mode, active);
+            }
+        }
+
+        usleep(100000);
+    }
+
+    return 0;
+}
