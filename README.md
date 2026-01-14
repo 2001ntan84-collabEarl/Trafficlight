@@ -1,4 +1,5 @@
 L1 : normal time
+
 [NORMAL S01] (05s) | R3 (S-N)=RED    | R1(W->E)=RED    | R1(E->W)=RED    | PED=RED  
 [NORMAL S02] (05s) | R3 (S-N)=PRE-Y  | R1(W->E)=RED    | R1(E->W)=RED    | PED=RED  
 [NORMAL S03] (20s) | R3 (S-N)=RS-G   | R1(W->E)=RED    | R1(E->W)=RED    | PED=RED  
